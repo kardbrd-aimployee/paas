@@ -40,14 +40,20 @@ make deploy SERVER=user@host REMOTE_PATH=paas
 - **reverse-proxy (traefik)**: Routes traffic, handles SSL via Let's Encrypt
 - **postgres**: Shared PostgreSQL database (port 5432)
 - **valkey**: Redis-compatible cache (port 6379)
-- **postgres-backup**: Scheduled S3 backups (cron-based, built from `backup/`)
+- **postgres-backup**: Scheduled S3 backups (interval loop, built from `backup/`)
 - **postgres-restore**: On-demand restore (uses `--profile restore`)
 
 ### Backup System (`backup/` directory)
 Custom Docker image based on postgres:18 with AWS CLI:
-- `backup.sh`: Entry point - runs one-time or schedules via cron
-- `do-backup.sh`: Performs pg_dump, optional encryption, uploads to S3
-- `restore.sh`: Downloads latest backup from S3, decrypts if needed, restores
+- `backup.sh`: Entry point - runs once or schedules backups, retrying failed attempts
+- `do-backup.sh`: Waits for PostgreSQL, validates pg_dump/pg_dumpall, optionally encrypts, uploads and verifies S3 metadata
+- `restore.sh`: Validates a selected S3 or local archive and restores with SQL error checking
+- `common.sh`: Shared PostgreSQL readiness, S3 configuration, and private temporary-file helpers
+
+Run `make test` for failure tests and an encrypted restore against disposable
+PostgreSQL 18 instances. Full-cluster restore requires a fresh target with a
+bootstrap superuser absent from the source dump. Do not test restore against the
+production database. Keep downloaded archives and credentials outside Git.
 
 Supports multiple S3-compatible providers: AWS S3, Cloudflare R2, DigitalOcean Spaces, Backblaze B2, Wasabi, MinIO.
 

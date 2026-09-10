@@ -1,70 +1,76 @@
-#!/bin/sh
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+source "$SCRIPT_DIR/common.sh"
 
-export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
-export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
-export AWS_DEFAULT_REGION=$S3_REGION
-export PGPASSWORD=$POSTGRES_PASSWORD
-
-AWS_ARGS=""
-if [ -n "$S3_ENDPOINT" ]; then
-  AWS_ARGS="--endpoint-url $S3_ENDPOINT"
-fi
-
-POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER"
-
-if [ -z "$S3_PREFIX" ]; then
-  S3_PREFIX=""
+init_workdir
+expected_checksum="${BACKUP_SHA256:-}"
+if [[ -n "${RESTORE_FILE:-}" ]]; then
+  [[ -f "$RESTORE_FILE" ]] || fail "Local restore archive does not exist"
+  archive_name="${RESTORE_FILE##*/}"
+  cp -- "$RESTORE_FILE" "$WORK_DIR/archive"
 else
-  S3_PREFIX="/${S3_PREFIX}"
-fi
-
-echo "Finding latest backup in s3://${S3_BUCKET}${S3_PREFIX}/"
-LATEST_BACKUP=$(aws $AWS_ARGS s3 ls "s3://${S3_BUCKET}${S3_PREFIX}/" | sort -r | head -n 1 | awk '{print $4}')
-
-if [ -z "$LATEST_BACKUP" ]; then
-  echo "Error: No backups found"
-  exit 1
-fi
-
-echo "Latest backup: $LATEST_BACKUP"
-
-SRC_FILE=$LATEST_BACKUP
-
-echo "Downloading backup from S3..."
-aws $AWS_ARGS s3 cp "s3://${S3_BUCKET}${S3_PREFIX}/${LATEST_BACKUP}" $SRC_FILE
-
-if [[ $SRC_FILE == *.enc ]]; then
-  if [ -z "$ENCRYPTION_PASSWORD" ]; then
-    echo "Error: Backup is encrypted but ENCRYPTION_PASSWORD is not set"
-    exit 1
+  init_s3
+  object_key="${BACKUP_KEY:-}"
+  if [[ -z "$object_key" ]]; then
+    if [[ "${POSTGRES_BACKUP_ALL:-false}" == true ]]; then
+      database_prefix=all
+    else
+      database_prefix="${POSTGRES_DATABASE:-postgres}"
+      [[ "$database_prefix" != *,* ]] || fail "Restore one database at a time"
+    fi
+    object_key=$(aws "${AWS_ARGS[@]}" s3api list-objects-v2 --bucket "$S3_BUCKET" \
+      --prefix "${OBJECT_PREFIX}${database_prefix}_" \
+      --query 'sort_by(Contents, &LastModified)[-1].Key' --output text)
+    [[ -n "$object_key" && "$object_key" != None ]] || fail "No matching backup found"
   fi
-  echo "Decrypting backup..."
-  openssl enc -aes-256-cbc -d -in $SRC_FILE -out ${SRC_FILE%.enc} -k $ENCRYPTION_PASSWORD
-  SRC_FILE=${SRC_FILE%.enc}
+  archive_name="${object_key##*/}"
+  expected_checksum=$(aws "${AWS_ARGS[@]}" s3api head-object --bucket "$S3_BUCKET" --key "$object_key" \
+    --query 'Metadata.sha256' --output text)
+  aws "${AWS_ARGS[@]}" s3 cp "s3://$S3_BUCKET/$object_key" "$WORK_DIR/archive" --only-show-errors
 fi
 
-if [[ $SRC_FILE == *.gz ]]; then
-  echo "Decompressing backup..."
-  gunzip -c $SRC_FILE > restore.sql
+if [[ -n "$expected_checksum" && "$expected_checksum" != None ]]; then
+  [[ "$expected_checksum" =~ ^[0-9a-f]{64}$ ]] || fail "Invalid backup checksum"
+  actual_checksum=$(sha256sum "$WORK_DIR/archive")
+  [[ "${actual_checksum%% *}" == "$expected_checksum" ]] || fail "Archive checksum mismatch; database is unchanged"
 else
-  cp $SRC_FILE restore.sql
+  echo "Archive has no recorded SHA-256 (legacy/local backup); validating archive contents"
 fi
 
-if [ "$DROP_PUBLIC" = "yes" ]; then
-  echo "Dropping public schema..."
-  psql $POSTGRES_HOST_OPTS -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+source_file="$WORK_DIR/archive"
+if [[ "$archive_name" == *.enc ]]; then
+  [[ -n "${ENCRYPTION_PASSWORD:-}" ]] || fail "The archive requires ENCRYPTION_PASSWORD"
+  export ENCRYPTION_PASSWORD
+  openssl enc -aes-256-cbc -d -in "$source_file" -out "$WORK_DIR/decrypted" -pass env:ENCRYPTION_PASSWORD
+  source_file="$WORK_DIR/decrypted"
+  archive_name="${archive_name%.enc}"
 fi
+case "$archive_name" in
+  *.sql.gz) gzip -dc "$source_file" > "$WORK_DIR/restore.sql" ;;
+  *.sql) cp -- "$source_file" "$WORK_DIR/restore.sql" ;;
+  *) fail "Unsupported archive type" ;;
+esac
+[[ -s "$WORK_DIR/restore.sql" ]] || fail "The SQL dump is empty; database is unchanged"
 
-if [ "$POSTGRES_BACKUP_ALL" = "true" ]; then
-  echo "Restoring all databases..."
-  psql $POSTGRES_HOST_OPTS < restore.sql
+database="${POSTGRES_DATABASE:-postgres}"
+if [[ "${POSTGRES_BACKUP_ALL:-false}" == true ]]; then
+  [[ "${DROP_PUBLIC:-no}" != yes ]] || fail "DROP_PUBLIC is only valid for single-database restores; restore a cluster into a fresh instance"
+  database=postgres
 else
-  for DB in $(echo $POSTGRES_DATABASE | tr "," "\n"); do
-    echo "Restoring database: $DB"
-    psql $POSTGRES_HOST_OPTS $DB < restore.sql
-  done
+  [[ "$database" != *,* ]] || fail "Restore one database at a time"
+  [[ "$archive_name" != all_* ]] || fail "Cluster archive requires POSTGRES_BACKUP_ALL=true"
 fi
 
+init_postgres
+wait_for_postgres
+if [[ "${DROP_PUBLIC:-no}" == yes ]]; then
+  psql "${PG_ARGS[@]}" -X --set=ON_ERROR_STOP=1 --dbname="$database" \
+    --command='DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+fi
+echo "Restoring validated SQL dump..."
+# Discard successful command output: SQL can emit sensitive role/session values.
+# Fail immediately on SQL errors, including failures in another database reached
+# by a pg_dumpall \connect command.
+psql "${PG_ARGS[@]}" -X --set=ON_ERROR_STOP=1 --dbname="$database" --file="$WORK_DIR/restore.sql" >/dev/null
 echo "Restore completed successfully"
-rm -f restore.sql $LATEST_BACKUP ${LATEST_BACKUP%.enc}
