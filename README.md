@@ -134,6 +134,17 @@ directory. Compression/encryption/upload failures return nonzero. The uploaded
 object must have the expected size and SHA-256 metadata before success is reported.
 The output records the exact `BACKUP_OBJECT` and `BACKUP_SHA256` for later verification.
 
+If an S3-compatible provider rejects `CompleteMultipartUpload` with `BadDigest`,
+try setting `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` in `.env`. This resolved
+a multipart upload failure with DigitalOcean Spaces and AWS CLI 2.23.6. The setting
+limits AWS CLI's optional request checksums; archive size and SHA-256 verification
+remain enabled. See the [AWS checksum configuration documentation](https://docs.aws.amazon.com/sdkref/latest/guide/feature-dataintegrity.html).
+Recreate only the backup service to apply the setting:
+
+```bash
+docker compose up -d --no-deps postgres-backup
+```
+
 The scheduler runs immediately at startup, then waits for the configured interval
 after a successful backup (`@daily` by default). A failed attempt retries after
 `BACKUP_RETRY_INTERVAL` seconds (default 300), rather than waiting another day.
