@@ -1,4 +1,4 @@
-.PHONY: .env deploy gen-admin-auth set-admin-auth backup restore
+.PHONY: .env deploy gen-admin-auth set-admin-auth backup restore test
 
 .env:
 	cp example.env .env
@@ -35,6 +35,11 @@ backup:
 	@docker compose run -e SCHEDULE='**None**' --rm postgres-backup
 	@echo "✓ Backup completed"
 
+test:
+	docker build -t paas-backup:verification backup
+	docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$(CURDIR):/work:ro" -w /work --entrypoint python3 paas-backup:verification -m unittest discover -s tests -v
+	bash tests/integration.sh
+
 restore:
 	@echo "⚠️  WARNING: This will RESTORE database from S3 and may DESTROY existing data!"
 	@echo "⚠️  Ensure PostgreSQL backup container is stopped during restore!"
@@ -48,10 +53,10 @@ restore:
 		echo "Restore cancelled."; \
 		exit 1; \
 	fi
-	@echo "Stopping postgres-backup..."
-	@docker compose stop postgres-backup || true
-	@echo "Running restore..."
-	@docker compose --profile restore run --rm postgres-restore
-	@echo "Restore completed! Starting postgres-backup..."
-	@docker compose start postgres-backup || true
+	@set -e; \
+	was_running=$$(docker compose ps --status running -q postgres-backup); \
+	if [ -n "$$was_running" ]; then docker compose stop postgres-backup; fi; \
+	trap 'if [ -n "$$was_running" ]; then docker compose start postgres-backup; fi' EXIT; \
+	echo "Running restore..."; \
+	docker compose --profile restore run --rm postgres-restore
 	@echo "✓ Restore process finished"

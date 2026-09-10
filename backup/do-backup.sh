@@ -1,80 +1,56 @@
-#!/bin/sh
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+source "$SCRIPT_DIR/common.sh"
 
-if [ -z "$S3_ACCESS_KEY_ID" ]; then
-  echo "Error: S3_ACCESS_KEY_ID is required"
-  exit 1
-fi
+init_postgres
+init_s3
+init_workdir
+wait_for_postgres
+read -r -a EXTRA_ARGS <<< "${POSTGRES_EXTRA_OPTS:-}"
 
-if [ -z "$S3_SECRET_ACCESS_KEY" ]; then
-  echo "Error: S3_SECRET_ACCESS_KEY is required"
-  exit 1
-fi
-
-if [ -z "$S3_BUCKET" ]; then
-  echo "Error: S3_BUCKET is required"
-  exit 1
-fi
-
-export AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID
-export AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY
-export AWS_DEFAULT_REGION=$S3_REGION
-
-AWS_ARGS=""
-if [ -n "$S3_ENDPOINT" ]; then
-  AWS_ARGS="--endpoint-url $S3_ENDPOINT"
-fi
-
-export PGPASSWORD=$POSTGRES_PASSWORD
-
-POSTGRES_HOST_OPTS="-h $POSTGRES_HOST -p $POSTGRES_PORT -U $POSTGRES_USER $POSTGRES_EXTRA_OPTS"
-
-if [ -z "$S3_PREFIX" ]; then
-  S3_PREFIX=""
+if [[ "${POSTGRES_BACKUP_ALL:-false}" == true ]]; then
+  DATABASES=(all)
 else
-  S3_PREFIX="/${S3_PREFIX}"
+  IFS=, read -r -a DATABASES <<< "${POSTGRES_DATABASE:-postgres}"
 fi
 
-if [ "$POSTGRES_BACKUP_ALL" = "true" ]; then
-  SRC_FILE=dump.sql.gz
-  DEST_FILE=all_$(date +"%Y-%m-%dT%H:%M:%SZ").sql.gz
-
-  echo "Creating dump of all databases from ${POSTGRES_HOST}..."
-  pg_dumpall $POSTGRES_HOST_OPTS | gzip > $SRC_FILE
-
-  if [ -n "$ENCRYPTION_PASSWORD" ]; then
-    echo "Encrypting ${SRC_FILE}"
-    openssl enc -aes-256-cbc -in $SRC_FILE -out ${SRC_FILE}.enc -k $ENCRYPTION_PASSWORD
-    rm $SRC_FILE
-    SRC_FILE="${SRC_FILE}.enc"
-    DEST_FILE="${DEST_FILE}.enc"
+for database in "${DATABASES[@]}"; do
+  [[ -n "$database" ]] || fail "An empty database name was configured"
+  dump_file="$WORK_DIR/dump.sql"
+  if [[ "${POSTGRES_BACKUP_ALL:-false}" == true ]]; then
+    echo "Creating dump of all databases..."
+    pg_dumpall "${PG_ARGS[@]}" "${EXTRA_ARGS[@]}" --file="$dump_file"
+  else
+    echo "Creating dump of database: $database"
+    pg_dump "${PG_ARGS[@]}" "${EXTRA_ARGS[@]}" --dbname="$database" --file="$dump_file"
   fi
-
-  echo "Uploading dump to $S3_BUCKET"
-  aws $AWS_ARGS s3 cp $SRC_FILE "s3://${S3_BUCKET}${S3_PREFIX}/${DEST_FILE}"
-
-  echo "SQL backup uploaded successfully"
-  rm -rf $SRC_FILE
-else
-  for DB in $(echo $POSTGRES_DATABASE | tr "," "\n"); do
-    SRC_FILE=dump.sql.gz
-    DEST_FILE=${DB}_$(date +"%Y-%m-%dT%H:%M:%SZ").sql.gz
-
-    echo "Creating dump of ${DB} database from ${POSTGRES_HOST}..."
-    pg_dump $POSTGRES_HOST_OPTS $DB | gzip > $SRC_FILE
-
-    if [ -n "$ENCRYPTION_PASSWORD" ]; then
-      echo "Encrypting ${SRC_FILE}"
-      openssl enc -aes-256-cbc -in $SRC_FILE -out ${SRC_FILE}.enc -k $ENCRYPTION_PASSWORD
-      rm $SRC_FILE
-      SRC_FILE="${SRC_FILE}.enc"
-      DEST_FILE="${DEST_FILE}.enc"
-    fi
-
-    echo "Uploading dump to $S3_BUCKET"
-    aws $AWS_ARGS s3 cp $SRC_FILE "s3://${S3_BUCKET}${S3_PREFIX}/${DEST_FILE}"
-
-    echo "SQL backup uploaded successfully"
-    rm -rf $SRC_FILE
-  done
-fi
+  [[ -s "$dump_file" ]] || fail "Database dump is empty; refusing to upload"
+  sql_bytes=$(wc -c < "$dump_file")
+  gzip -c "$dump_file" > "$WORK_DIR/dump.sql.gz"
+  gzip -t "$WORK_DIR/dump.sql.gz"
+  upload_file="$WORK_DIR/dump.sql.gz"
+  # Nanoseconds and a unique suffix avoid collisions between scheduled/manual runs.
+  object_key="${OBJECT_PREFIX}${database}_$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')_${WORK_DIR##*.}.sql.gz"
+  if [[ -n "${ENCRYPTION_PASSWORD:-}" ]]; then
+    export ENCRYPTION_PASSWORD
+    # Preserve compatibility with existing encrypted archives; keep the password
+    # out of process arguments. Restore also supports these legacy AES archives.
+    openssl enc -aes-256-cbc -in "$upload_file" -out "$upload_file.enc" -pass env:ENCRYPTION_PASSWORD
+    upload_file+=".enc"
+    object_key+=".enc"
+  fi
+  checksum=$(sha256sum "$upload_file")
+  checksum="${checksum%% *}"
+  expected_size=$(wc -c < "$upload_file")
+  aws "${AWS_ARGS[@]}" s3 cp "$upload_file" "s3://$S3_BUCKET/$object_key" \
+    --only-show-errors --metadata "sha256=$checksum"
+  remote_info=$(aws "${AWS_ARGS[@]}" s3api head-object --bucket "$S3_BUCKET" --key "$object_key" \
+    --query '[ContentLength, Metadata.sha256]' --output text)
+  read -r remote_size remote_checksum <<< "$remote_info"
+  [[ "$remote_size" == "$expected_size" && "$remote_checksum" == "$checksum" ]] || fail "Uploaded object verification failed"
+  echo "BACKUP_OBJECT=s3://$S3_BUCKET/$object_key"
+  echo "BACKUP_SQL_BYTES=$sql_bytes BACKUP_OBJECT_BYTES=$expected_size BACKUP_SHA256=$checksum"
+  echo "SQL backup uploaded and verified successfully"
+  rm -f -- "$WORK_DIR"/dump.sql*
+done

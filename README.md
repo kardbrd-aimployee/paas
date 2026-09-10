@@ -128,9 +128,26 @@ To create an immediate backup:
 make backup
 ```
 
-This manually triggers a backup to S3, independent of the scheduled backups. The command displays the database and S3 location before uploading.
+This triggers an independent backup to S3. Each run waits for PostgreSQL, checks
+the dump command's exit status, rejects empty SQL, and uses a private temporary
+directory. Compression/encryption/upload failures return nonzero. The uploaded
+object must have the expected size and SHA-256 metadata before success is reported.
+The output records the exact `BACKUP_OBJECT` and `BACKUP_SHA256` for later verification.
 
-**Note:** Scheduled backups run automatically based on the `SCHEDULE` setting in `.env` (default: `@daily`).
+The scheduler runs immediately at startup, then waits for the configured interval
+after a successful backup (`@daily` by default). A failed attempt retries after
+`BACKUP_RETRY_INTERVAL` seconds (default 300), rather than waiting another day.
+`POSTGRES_WAIT_ATTEMPTS` and `POSTGRES_WAIT_INTERVAL` default to 30 attempts and
+two seconds. A readiness check is not proof of valid credentials: a failed dump
+still aborts without uploading anything.
+
+`POSTGRES_BACKUP_ALL=true` uses `pg_dumpall` to include databases and global roles.
+Otherwise, `POSTGRES_DATABASE` selects one database or a comma-separated list,
+each with a separate `pg_dump` archive. `POSTGRES_EXTRA_OPTS` must contain options
+supported by the selected tool; database-only flags cannot be passed to `pg_dumpall`.
+Encryption remains compatible with existing AES-256-CBC archives. Passwords are
+passed through the environment, not command arguments. Keep the encryption
+password separately: an encrypted archive is not recoverable without it.
 
 ## Restoring from Backup
 
@@ -146,16 +163,67 @@ The restore process:
 1. Prompts for confirmation (type "YES" to proceed)
 2. Displays target database and S3 location
 3. Stops the postgres-backup service
-4. Downloads and restores the latest backup from S3
-5. Restarts the postgres-backup service
+4. Downloads the latest backup matching the configured database/cluster prefix,
+   or the exact object selected with `BACKUP_KEY`
+5. Verifies SHA-256 metadata when present, decrypts/decompresses, rejects empty
+   dumps, and restores with PostgreSQL `ON_ERROR_STOP` enabled
+6. Restarts the postgres-backup service if it was running, even when restore fails
 
 ### Restore Configuration
 
-Set `DROP_PUBLIC=yes` in `.env` to drop existing schema before restore (default).
+`DROP_PUBLIC` defaults to `no`. Set it to `yes` only for an intentional
+single-database schema replacement; validation finishes before the schema is
+dropped, and the selected database is used explicitly. It is rejected for
+full-cluster restores.
 
-**Important:** The restore operation uses the "latest" backup based on file timestamps. Ensure your S3 bucket only contains backups you want to restore.
+Full-cluster dumps should be restored into a fresh PostgreSQL instance using a
+temporary bootstrap superuser name that does not exist in the source cluster.
+This avoids conflicts when the dump creates the original roles. Restore is not
+atomic across databases: a SQL error stops immediately but may leave earlier
+statements applied. Retry with a fresh local instance after correcting the error.
 
-**Safety Note:** Consider testing restores in a staging environment before production use.
+Prefer an explicit `BACKUP_KEY` when restoring from S3. Old archives without
+checksum metadata remain readable, but are identified as legacy and still must
+pass decryption, decompression, and nonempty-SQL checks.
+
+### Local restore rehearsal
+
+Build the backup image, download a chosen archive, and save its recorded SHA-256.
+Keep archives and credentials outside the Git checkout with owner-only permissions.
+Create a local `restore.env` containing a temporary `POSTGRES_PASSWORD` and the
+archive's `ENCRYPTION_PASSWORD`; it does not need production database or S3 keys.
+
+```bash
+docker build -t paas-backup:verification backup
+docker network create --internal backup-rehearsal
+docker run -d --name backup-restore-db --network backup-rehearsal \
+  --env-file /absolute/path/restore.env \
+  -e POSTGRES_USER=restore_operator -e POSTGRES_DB=postgres postgres:18
+docker run --rm --network backup-rehearsal \
+  --env-file /absolute/path/restore.env \
+  -v /absolute/path/downloads:/archives:ro \
+  -e POSTGRES_HOST=backup-restore-db -e POSTGRES_USER=restore_operator \
+  -e POSTGRES_BACKUP_ALL=true -e DROP_PUBLIC=no \
+  -e RESTORE_FILE=/archives/all_CHOSEN_BACKUP.sql.gz.enc \
+  -e BACKUP_SHA256=RECORDED_SHA256 \
+  --entrypoint /restore.sh paas-backup:verification
+```
+
+No host ports are published, and the internal network blocks external connections.
+Compare the restored database list, schema, table counts, and important records
+before treating a backup as verified. Then remove only these rehearsal resources:
+
+```bash
+docker rm -fv backup-restore-db
+docker network rm backup-rehearsal
+```
+
+### Tests
+
+`make test` builds the image, runs failure-injection tests, and performs an encrypted
+dump/restore against two disposable PostgreSQL 18 containers. The integration test
+checks database schema, rows, roles, and sequence state. S3 is simulated locally;
+no production credentials or database access are used. The same checks run in CI.
 
 ## Accessing Services
 
