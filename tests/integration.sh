@@ -43,7 +43,8 @@ SQL
 
 mkdir -p "$TEST_DIR/bin"
 ln -s /work/tests/fake_commands.py "$TEST_DIR/bin/aws"
-docker run --rm --network "$TEST_ID" \
+# Keep private fixture files owned by the invoking user on Linux bind mounts.
+docker run --rm --user "$(id -u):$(id -g)" --network "$TEST_ID" \
   -v "$REPO_DIR:/work:ro" -v "$TEST_DIR:/test-data" \
   -e PATH=/test-data/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   -e FAKE_ROOT=/test-data -e S3_ACCESS_KEY_ID=fixture -e S3_SECRET_ACCESS_KEY=fixture \
